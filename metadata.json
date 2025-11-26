@@ -1,0 +1,5 @@
+{
+  "name": "Signage Takeoff Agent",
+  "description": "AI-powered architectural drawing analysis for automated signage extraction and takeoff generation.",
+  "requestFramePermissions": []
+}
