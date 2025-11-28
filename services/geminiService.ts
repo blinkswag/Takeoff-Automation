@@ -1,5 +1,7 @@
 import { GoogleGenAI, Type, Schema, HarmCategory, HarmBlockThreshold } from "@google/genai";
-import { ProjectSettings, AnalysisResult, SignageItem, SignTypeDefinition } from "../types";
+import { ProjectSettings, AnalysisResult } from "../types";
+
+// --- STATIC CONFIGURATIONS (Moved out of function scope for performance) ---
 
 const SYSTEM_INSTRUCTION = `
 YOU ARE A DEDICATED “SIGNAGE TAKEOFF AGENT.”
@@ -30,7 +32,7 @@ PHASE 2: DATA EXTRACTION
    - If a sign type "A1" is defined in the legend with specific dimensions (e.g. 8"x8"), color, or material, propagate these values to every "A1" item in the takeoff.
    - SEARCH SPECIFICATIONS: Look for "Color", "Finish", "Material", "Substrate" fields in the sign type definition.
 
-4. VISUAL DEFINITION EXTRACTION (MANDATORY - PICTOGRAM & DIMENSIONS):
+4. VISUAL DEFINITION EXTRACTION (MANDATORY):
    - You **MUST** identify a "Visual Definition" for every Sign Type in the Catalog.
    - **TARGET**: The detailed **Pictogram**, Elevation Drawing, or Sketch in the Legend/Specs.
    - **CONTENT**: The bounding box must capture:
@@ -98,7 +100,7 @@ const RESPONSE_SCHEMA: Schema = {
           dimensions: { type: Type.STRING, description: "Width x Height x Depth/Thickness (e.g. 6'' x 6'' x 1/8''). Return empty string if not found." },
           color: { type: Type.STRING, description: "Sign color/finish. Return empty string if not found." },
           material: { type: Type.STRING, description: "Material & Layer info (e.g. Acrylic with raised text, 2nd surface print). Return empty string if not found." },
-          notes: { type: Type.STRING, description: "Combined Notes: MUST include specific location notes AND a summary of sign specs (Color, Material, Mounting) found in the legend." },
+          notes: { type: Type.STRING, description: "Combined Notes: Include specific location details AND a summary of sign specs (Color, Material, Mounting) if available." },
           boundingBox: { 
             type: Type.ARRAY, 
             items: { type: Type.NUMBER }, 
@@ -128,7 +130,7 @@ const RESPONSE_SCHEMA: Schema = {
           boundingBox: { 
              type: Type.ARRAY, 
              items: { type: Type.NUMBER }, 
-             description: "MANDATORY: Bounding box of the VISUAL DEFINITION (Pictogram + Dimensions) of this sign type. [ymin, xmin, ymax, xmax] 0-1000." 
+             description: "MANDATORY: Bounding box of the VISUAL DEFINITION of this sign type. [ymin, xmin, ymax, xmax] 0-1000." 
           },
           imageIndex: {
              type: Type.NUMBER,
@@ -142,8 +144,17 @@ const RESPONSE_SCHEMA: Schema = {
   required: ["takeoff", "catalog"],
 };
 
+const SAFETY_SETTINGS = [
+  { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+  { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+  { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+  { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+];
+
 // Helper for delay
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// --- EXPORTED FUNCTIONS ---
 
 export const analyzeDrawing = async (
   fileBase64: string,
@@ -248,12 +259,7 @@ export const analyzeDrawing = async (
           responseSchema: RESPONSE_SCHEMA,
           temperature: 0, 
           maxOutputTokens: 65536,
-          safetySettings: [
-            { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
-            { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
-            { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-            { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-          ],
+          safetySettings: SAFETY_SETTINGS,
         },
       });
 

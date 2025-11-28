@@ -3,7 +3,7 @@ import React, { useState, useCallback, useRef, useEffect } from 'react';
 import SettingsPanel from './components/SettingsPanel';
 import TakeoffTable from './components/TakeoffTable';
 import { ProjectSettings, AppState, AnalysisResult, SignageItem, SignTypeDefinition } from './types';
-import { analyzeDrawing, fileToBase64 } from './services/geminiService';
+import { analyzeDrawing } from './services/geminiService';
 import { convertPdfToImages } from './services/pdfService';
 import { UploadCloud, FileImage, AlertCircle, Loader2, Maximize2, ChevronLeft, ChevronRight, FileText, CheckCircle2, BookOpen, Plus, RefreshCw } from 'lucide-react';
 
@@ -131,46 +131,45 @@ const App: React.FC = () => {
     }
   };
 
-  const handleAddToProject = () => {
+  // Memoized handlers to prevent unnecessary child re-renders
+  const handleAddToProject = useCallback(() => {
     if (!analysisResult) return;
 
     // 1. Filter out existing items for the same sheets found in the new result to avoid duplication/outdated info
     const newSheetNames = new Set(analysisResult.takeoff.map(i => i.sheet));
-    const filteredMaster = masterTakeoff.filter(item => !newSheetNames.has(item.sheet));
+    setMasterTakeoff(prevMaster => {
+        const filteredMaster = prevMaster.filter(item => !newSheetNames.has(item.sheet));
+        return [...filteredMaster, ...analysisResult.takeoff];
+    });
 
-    // 2. Append new items
-    const newMasterTakeoff = [...filteredMaster, ...analysisResult.takeoff];
-    setMasterTakeoff(newMasterTakeoff);
+    // 2. Merge Catalogs (deduplicate by typeCode)
+    setMasterCatalog(prevCatalog => {
+        const catalogMap = new Map<string, SignTypeDefinition>();
+        prevCatalog.forEach(c => catalogMap.set(c.typeCode, c));
+        analysisResult.catalog.forEach(c => catalogMap.set(c.typeCode, c));
+        return Array.from(catalogMap.values());
+    });
 
-    // 3. Merge Catalogs (deduplicate by typeCode)
-    const catalogMap = new Map<string, SignTypeDefinition>();
-    masterCatalog.forEach(c => catalogMap.set(c.typeCode, c));
-    analysisResult.catalog.forEach(c => catalogMap.set(c.typeCode, c));
-    
-    setMasterCatalog(Array.from(catalogMap.values()));
-
-    // 4. Feedback
+    // 3. Feedback
     setSaveSuccess(true);
     setTimeout(() => setSaveSuccess(false), 3000);
-  };
+  }, [analysisResult]);
 
-  const handleRemoveRow = (itemToRemove: SignageItem) => {
+  const handleRemoveRow = useCallback((itemToRemove: SignageItem) => {
     if (viewMode === 'master') {
       setMasterTakeoff(prev => prev.filter(item => item !== itemToRemove));
     } else {
-      if (analysisResult) {
-        setAnalysisResult(prev => {
-          if (!prev) return null;
-          return {
-            ...prev,
-            takeoff: prev.takeoff.filter(item => item !== itemToRemove)
-          };
-        });
-      }
+      setAnalysisResult(prev => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          takeoff: prev.takeoff.filter(item => item !== itemToRemove)
+        };
+      });
     }
-  };
+  }, [viewMode]);
 
-  const handleUpdateItem = (itemToUpdate: SignageItem, updates: Partial<SignageItem>) => {
+  const handleUpdateItem = useCallback((itemToUpdate: SignageItem, updates: Partial<SignageItem>) => {
     if (viewMode === 'master') {
       setMasterTakeoff(prev => prev.map(item => item === itemToUpdate ? { ...item, ...updates } : item));
     } else {
@@ -182,7 +181,11 @@ const App: React.FC = () => {
         };
       });
     }
-  };
+  }, [viewMode]);
+
+  const onToggleView = useCallback((isMaster: boolean) => {
+    setViewMode(isMaster ? 'master' : 'current');
+  }, []);
 
   // Full Project Reset
   const startNewProject = () => {
@@ -498,7 +501,7 @@ const App: React.FC = () => {
                     takeoff={viewMode === 'master' ? masterTakeoff : (analysisResult?.takeoff || [])}
                     catalog={viewMode === 'master' ? masterCatalog : (analysisResult?.catalog || [])}
                     isMasterView={viewMode === 'master'}
-                    onToggleView={(isMaster) => setViewMode(isMaster ? 'master' : 'current')}
+                    onToggleView={onToggleView}
                     onAddToProject={handleAddToProject}
                     onRemoveRow={handleRemoveRow}
                     onUpdateItem={handleUpdateItem}
