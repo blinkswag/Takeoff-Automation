@@ -1,3 +1,4 @@
+
 export interface SignageItem {
   sheet: string;
   roomNumber: string;
@@ -5,7 +6,13 @@ export interface SignageItem {
   signType: string;
   isADA: boolean;
   quantity: number;
+  dimensions: string;
+  color: string;
+  material: string;
   notes: string;
+  boundingBox?: number[]; // [ymin, xmin, ymax, xmax] normalized 0-1000 (Location on Plan)
+  designImage?: string; // base64 data url of the sign type specification/detail
+  dataSource?: 'Schedule' | 'Visual' | 'Rule'; // Origin of the item
 }
 
 export interface SignTypeDefinition {
@@ -14,6 +21,11 @@ export interface SignTypeDefinition {
   description: string;
   dimensions?: string;
   mounting?: string;
+  color?: string;
+  material?: string;
+  boundingBox?: number[]; // [ymin, xmin, ymax, xmax] normalized 0-1000 (Location of Detail Drawing)
+  imageIndex?: number; // Index of the image containing this definition (0-based)
+  designImage?: string; // base64 data url of the cropped detail
 }
 
 export interface AnalysisResult {
@@ -22,14 +34,8 @@ export interface AnalysisResult {
 }
 
 export interface ProjectSettings {
-  ruleA_OneSignPerRoom: boolean;
-  ruleB_CombinedADASigns: boolean;
-  ruleC_IdentifyExits: boolean;
-  ruleD_ExteriorDoorNumbers: boolean;
-  ruleE_IncludeDirectionals: boolean;
-  ruleF_StairSignage: boolean;
-  ruleG_SlidingBarSigns: boolean;
-  extractionMode: 'Page-by-Page' | 'Block-Based' | 'Clockwise-Sweep' | 'Quadrant-Sweep';
+  // Settings are now simplified as the Agent handles strategy automatically
+  autoStrategy: boolean; 
 }
 
 export enum AppState {
