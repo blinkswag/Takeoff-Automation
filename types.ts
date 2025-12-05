@@ -1,6 +1,7 @@
 
 export interface SignageItem {
   sheet: string;
+  pageNumber?: number; // Page index in the PDF/Project (1-based)
   roomNumber: string;
   roomName: string;
   signType: string;
@@ -33,9 +34,18 @@ export interface AnalysisResult {
   catalog: SignTypeDefinition[];
 }
 
+export type KeyPageCategory = 'General' | 'Schedule' | 'Legend' | 'Floor Plan' | 'Detail';
+
+export interface KeyPage {
+  sheetNumber: string;
+  description: string;
+  category: KeyPageCategory;
+  pageIndex: number; // 0-based index in the PDF
+}
+
 export interface ProjectSettings {
-  // Settings are now simplified as the Agent handles strategy automatically
-  autoStrategy: boolean; 
+  autoStrategy: boolean;
+  keyPages?: KeyPage[]; // Store detected key pages
 }
 
 export enum AppState {

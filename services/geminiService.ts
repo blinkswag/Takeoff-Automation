@@ -1,7 +1,7 @@
 import { GoogleGenAI, Type, Schema, HarmCategory, HarmBlockThreshold } from "@google/genai";
-import { ProjectSettings, AnalysisResult } from "../types";
+import { ProjectSettings, AnalysisResult, SignageItem, SignTypeDefinition, KeyPage } from "../types";
 
-// --- STATIC CONFIGURATIONS (Moved out of function scope for performance) ---
+// --- STATIC CONFIGURATIONS ---
 
 const SYSTEM_INSTRUCTION = `
 YOU ARE A DEDICATED “SIGNAGE TAKEOFF AGENT.”
@@ -21,6 +21,7 @@ PHASE 2: DATA EXTRACTION
    - **CRITICAL**: Mark these items with "dataSource": "Schedule".
    - Extract: Location (Room #), Sign Type, Quantity, Message/Text, Size/Dimensions, Color, and Material.
    - Map "Message" content to the 'roomName'.
+   - **CRITICAL LINKING**: If the Schedule lists a Sign Type (e.g., "Type A"), LOOK FOR THE VISUAL DEFINITION of "Type A" in the Reference Pages (Specification Sheets).
 
 2. VISUAL PLAN EXTRACTION (PRIORITY #2):
    - Scan the Floor Plan for sign symbols.
@@ -34,14 +35,17 @@ PHASE 2: DATA EXTRACTION
 
 4. VISUAL DEFINITION EXTRACTION (MANDATORY):
    - You **MUST** identify a "Visual Definition" for every Sign Type in the Catalog.
-   - **TARGET**: The detailed **Pictogram**, Elevation Drawing, or Sketch in the Legend/Specs.
-   - **CONTENT**: The bounding box must capture:
-     1. The Sign Face (Pictogram, Icon, Text, Braille dots).
-     2. The Mounting Hardware (if visible).
-     3. **CRITICAL**: All adjacent **Dimension Lines**, **Arrows**, and **Size Labels** (e.g. "6in", "V.I.F").
-   - **FALLBACK**: If no legend detail exists, find a CLEAR symbol on the Floor Plan.
-   - Return the 'boundingBox' [ymin, xmin, ymax, xmax] (0-1000 scale) and 'imageIndex'.
-   - We use this to crop and show the user the "Design" of the sign.
+   - **SOURCES**: Look in **Specification Pages**, **Reference Pages**, **Target Sheet Legends**, or **Signage Schedules** (Symbol Column).
+   - **RESTRICTION**: **DO NOT** use the small location symbol on the floor plan map as the Visual Definition.
+   - **BOUNDING BOX STRATEGY**:
+     - Treat the "Visual Definition" as the **Sign Face + Dimensions**.
+     - The box **MUST** capture the Sign Face (Pictogram, Icon, Text).
+     - The box **MUST** extend to capture ALL adjacent **Dimension Lines**, **Extension Lines**, **Arrows**, and **Size Labels** (e.g. "6in", "8 inch", "V.I.F").
+     - **DO NOT CROP OUT** the size text found next to the drawing.
+     - Capture the full technical drawing block for the sign type.
+   - **MATCHING**: 
+     - Verify the text label (e.g. "Type A1") is physically close to the graphic.
+     - **OPTIONAL**: If readable, compare text on the sign face with the schedule to confirm match, but prioritize the Sign Type Label.
 
 CRITICAL ATTRIBUTE EXTRACTION RULES:
 1. NOTES FIELD POPULATION (MANDATORY):
@@ -49,7 +53,6 @@ CRITICAL ATTRIBUTE EXTRACTION RULES:
    - **Structure**: "Location/Message Info. [Specs: Material, Color, Mounting]".
    - **Legend Integration**: If the Legend says Type A is "Acrylic with Standoffs", this text MUST appear in the notes for every Type A sign.
    - Example: "Conf Rm 102. [Specs: 1/4'' Acrylic, Frosted, Standoff Mount]".
-   - **DO NOT** leave notes blank if specification info exists in the legend.
 
 2. ADA COMPLIANCE (EVIDENCE-BASED ONLY):
    - You MUST set 'isADA' to TRUE *ONLY* if there is clear evidence in the sign definition, notes, or visual detail.
@@ -104,7 +107,7 @@ const RESPONSE_SCHEMA: Schema = {
           boundingBox: { 
             type: Type.ARRAY, 
             items: { type: Type.NUMBER }, 
-            description: "MANDATORY: Bounding box of the sign location on the FLOOR PLAN [ymin, xmin, ymax, xmax] 0-1000. Must be provided for every item to enable thumbnails." 
+            description: "MANDATORY: Bounding box of the sign location on the FLOOR PLAN [ymin, xmin, ymax, xmax] 0-1000. Must be provided for every item." 
           },
           dataSource: {
              type: Type.STRING,
@@ -130,7 +133,7 @@ const RESPONSE_SCHEMA: Schema = {
           boundingBox: { 
              type: Type.ARRAY, 
              items: { type: Type.NUMBER }, 
-             description: "MANDATORY: Bounding box of the VISUAL DEFINITION of this sign type. [ymin, xmin, ymax, xmax] 0-1000." 
+             description: "MANDATORY: Bounding box of the VISUAL DEFINITION of this sign type. Must include the sign face PLUS dimension lines and labels. [ymin, xmin, ymax, xmax] 0-1000." 
           },
           imageIndex: {
              type: Type.NUMBER,
@@ -156,12 +159,165 @@ const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 // --- EXPORTED FUNCTIONS ---
 
+export const fileToBase64 = (file: File): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        const base64 = reader.result.split(",")[1];
+        resolve(base64);
+      } else {
+        reject(new Error("Failed to process file"));
+      }
+    };
+    reader.onerror = (error) => reject(error);
+  });
+};
+
+/**
+ * Scans the first few pages to find the Drawing List/Index and identify Key Pages.
+ * Maps Sheet Numbers (e.g., A-101) to actual PDF Page Indices using strict logic to avoid the TOC itself.
+ */
+export const identifyKeyPages = async (
+  firstFewPagesBase64: string[],
+  pageTexts: string[] // Raw text of all pages to map Sheet Number -> Page Index
+): Promise<KeyPage[]> => {
+  const apiKey = process.env.API_KEY;
+  if (!apiKey) throw new Error("API Key not found");
+  const ai = new GoogleGenAI({ apiKey });
+
+  const systemInstruction = `
+    You are an architectural document analyzer. 
+    Your job is to read the "Sheet Index", "Drawing List", or "Table of Contents" from the provided title sheet images.
+    
+    STRICTLY Identify ONLY pages containing the following keywords or concepts:
+    - "Signage" (Exterior, Interior, Directional, Wayfinding)
+    - "ADA" (Accessibility)
+    - "Signage Schedule" or "Sign Schedule"
+    - "Signage Specification" or "Sign Specification"
+    - "Signage Design"
+    - "Signage Details"
+    
+    Do NOT include:
+    - Structural drawings
+    - Mechanical/Electrical/Plumbing (unless explicitly labeled "Signage")
+    - General Floor Plans (unless they are specific "Signage Plans")
+    - Reflected Ceiling Plans (unless signage is primary)
+    - General Legends (unless Signage Legend)
+    
+    Return a list of these key sheets with their Sheet Number (e.g. "A-101") and Description.
+  `;
+
+  const schema: Schema = {
+    type: Type.OBJECT,
+    properties: {
+      keySheets: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            sheetNumber: { type: Type.STRING },
+            description: { type: Type.STRING },
+            category: { type: Type.STRING, enum: ['Legend', 'Schedule', 'Detail', 'Floor Plan', 'General'] }
+          },
+          required: ["sheetNumber", "description", "category"]
+        }
+      }
+    },
+    required: ["keySheets"]
+  };
+
+  const parts: any[] = [];
+  firstFewPagesBase64.forEach(b64 => {
+    parts.push({ inlineData: { data: b64, mimeType: "image/jpeg" } });
+  });
+  parts.push({ text: "Find the Drawing Index and list all sheets strictly relevant to Signage, Legends, or Schedules." });
+
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: { parts },
+      config: {
+        systemInstruction,
+        responseMimeType: "application/json",
+        responseSchema: schema,
+        temperature: 0,
+        safetySettings: SAFETY_SETTINGS
+      }
+    });
+
+    const text = response.text;
+    if (!text) return [];
+    
+    const data = JSON.parse(text);
+    const identified: any[] = data.keySheets || [];
+    
+    // Post-process: Map Sheet Numbers to Actual PDF Page Indices using the raw text index.
+    // Logic improvement: Avoid matching the Sheet Index (Table of Contents) page itself.
+    const keyPages: KeyPage[] = [];
+    
+    // The range of pages we scanned to find the Index (likely 0, 1, 2)
+    const tocScanRange = firstFewPagesBase64.length; 
+
+    for (const item of identified) {
+      // Robust normalization: Remove spaces, dashes, dots to match 'A-101' against 'A101' or 'A.101'
+      const searchStr = item.sheetNumber.replace(/[\s\-\.]/g, ''); 
+      if (!searchStr) continue;
+
+      // Find ALL occurrences of the sheet number in the document text
+      const matches: number[] = [];
+      for (let i = 0; i < pageTexts.length; i++) {
+        const rawText = pageTexts[i].replace(/[\s\-\.]/g, ''); 
+        if (rawText.includes(searchStr)) {
+          matches.push(i);
+        }
+      }
+
+      let bestIndex = -1;
+
+      if (matches.length > 0) {
+        // Strategy: 
+        // 1. Prefer the LAST match in the document (Architectural sets often list Index first, Sheet later).
+        const lastMatch = matches[matches.length - 1];
+        
+        // 2. Anti-Loop Logic:
+        // If the LAST match found is STILL within the range of pages we scanned for the Index (e.g. pages 0-2),
+        // and the document has more pages than that, then we likely only found the TOC entry itself.
+        // It is better to return no link (-1) than to link back to the TOC.
+        if (lastMatch < tocScanRange && pageTexts.length > tocScanRange) {
+           bestIndex = -1;
+        } else {
+           bestIndex = lastMatch;
+        }
+      }
+      
+      if (bestIndex !== -1) {
+        keyPages.push({
+          sheetNumber: item.sheetNumber,
+          description: item.description,
+          category: item.category,
+          pageIndex: bestIndex
+        });
+      }
+    }
+    
+    return keyPages;
+
+  } catch (e) {
+    console.warn("Failed to identify key pages", e);
+    return [];
+  }
+};
+
 export const analyzeDrawing = async (
   fileBase64: string,
   mimeType: string,
   settings: ProjectSettings,
   fileName: string,
-  referenceImages: string[] = []
+  referenceImages: string[] = [],
+  pdfTextLayer?: string, // NEW: Optional text layer content from PDF
+  signal?: AbortSignal // NEW: Abort signal for cancellation
 ): Promise<AnalysisResult> => {
   const apiKey = process.env.API_KEY;
   if (!apiKey) throw new Error("API Key not found");
@@ -177,28 +333,51 @@ export const analyzeDrawing = async (
   let prompt = `
     Analyze the provided ${allImages.length} image(s) to generate a signage takeoff.
     
-    IMAGE INDEX GUIDE:
-    ${referenceImages.map((_, i) => `- Image ${i}: Reference/Legend/Schedule`).join('\n')}
-    - Image ${targetImageIndex}: TARGET SHEET (${fileName}) - Architectural Floor Plan.
+    IMAGE MAPPING GUIDE:
+    ${referenceImages.map((_, i) => `- Image Index ${i}: Reference/Legend/Schedule Sheet (LOOK HERE FOR DESIGN VISUALS)`).join('\n')}
+    - Image Index ${targetImageIndex}: TARGET SHEET (${fileName}) - Architectural Floor Plan.
 
     STEP 0: COMPREHENSIVE CONTEXT ANALYSIS
     - Read the entire content of ALL images.
     - Identify the drawing scale, key symbols, and Signage Schedule.
-    
+  `;
+
+  // Inject PDF Text Layer if available
+  if (pdfTextLayer) {
+    prompt += `
+    \n*** SUPPLEMENTAL TEXT LAYER DATA ***
+    The following text was extracted directly from the PDF file layer of the TARGET SHEET. 
+    Use this text to verify room numbers, notes, or sign codes that might be blurry in the image.
+    PDF TEXT CONTENT:
+    """
+    ${pdfTextLayer.substring(0, 30000)} ... (truncated if too long)
+    """
+    *** END TEXT LAYER DATA ***
+    `;
+  }
+
+  prompt += `
     STEP 1: EXTRACT SIGN TYPE CATALOG (VISUALS)
     - Scan ALL images (especially References) for the "Signage Legend" or "Sign Type Specifications".
     - For each Sign Type (e.g. "A1", "Exit"), extract its attributes (Dimensions, Color, Material).
     
-    [CRITICAL VISUAL EXTRACTION - PICTOGRAM & DIMENSIONS]
+    [CRITICAL VISUAL EXTRACTION - INCLUDE DIMENSIONS]
     - YOU MUST PROVIDE A 'boundingBox' FOR EVERY SIGN TYPE IN THE CATALOG.
-    - **PREFERRED**: Use the Detail Drawing in the Specs/Legend. 
+    - **SOURCES**:
+      1. **SPEC SHEETS (Images 0 to ${referenceImages.length - 1})**: Look for detailed drawings matching the Sign Type Code.
+      2. **SCHEDULES**: If the Schedule on the target sheet has a "Visual" or "Symbol" column, use that.
+      3. **SCHEDULE REFERENCES**: If the Schedule says "See Detail 5/A-501", and you have that page in references, look there.
+      4. **LEGENDS**: Look for the Legend block on the Target Sheet (Image ${targetImageIndex}).
     - **SCOPE**: The box MUST encompass:
         1. The **Pictogram** / Icon / Text.
         2. The **Sign Frame** / Hardware.
-        3. ALL surrounding **DIMENSION LINES** and **LABELS**.
-    - **DO NOT** crop too tightly. It is better to include a bit of extra whitespace than to cut off dimensions or notes.
-    - **FALLBACK**: If no Spec drawing exists, FIND A CLEAR SYMBOL ON THE FLOOR PLAN (Image ${targetImageIndex}) and use that as the visual definition (bbox + imageIndex).
-    - Provide the correct 'imageIndex'.
+        3. ALL surrounding **DIMENSION LINES** and **LABELS** that belong to this sign detail.
+        4. **EXPAND THE BOX**: Deliberately include the text describing the size (e.g. '8"', '6"') even if it's offset from the frame.
+    - **CROP INSTRUCTION**: The image MUST include the dimension guides. A crop of just the sign face without dimensions is INCOMPLETE.
+    - **MATCHING**: 
+        - Verify the text label (e.g. "Type A1") is physically close to the graphic.
+        - **OPTIONAL CHECK**: If the text inside the visual design (e.g. "EXIT") is readable, compare it with the schedule data to confirm the match. Do NOT reject a clear Sign Type Label match if the copy text is blurry.
+    - Provide the correct 'imageIndex' (Reference Index vs Target Index).
     
     [CRITICAL ADA & VISUAL CHECK - STRICT EVIDENCE REQUIRED]
     - PERFORM DEEP OCR ON SPEC NOTES: Read the text blocks and leader lines associated with each sign type illustration.
@@ -212,13 +391,14 @@ export const analyzeDrawing = async (
     
     STEP 2: EXTRACT TAKEOFF FROM TARGET IMAGE (${fileName})
     - **PRIORITY**: If a Signage Schedule table is present, extract it fully. Set 'dataSource' = 'Schedule'.
+    - **EXHAUSTIVE EXTRACTION**: EXTRACT EVERY SINGLE ROW from the schedule. Do not stop until all rows are read.
     - THEN, scan the plan for visual symbols.
       * If a symbol MATCHES a schedule row, assume it is covered by the schedule.
       * If a symbol is found visually but NOT in the schedule (an EXTRA sign), extract it and set 'dataSource' = 'Visual'.
       * Ensure these visual-only finds are marked clearly.
     - Generate the 'takeoff' list.
     - For each item, assign the correct 'signType'.
-    - **MANDATORY**: Provide 'boundingBox' for the symbol location on the plan for ALL items. We use this to show thumbnails if the catalog visual is missing.
+    - **MANDATORY**: Provide 'boundingBox' for the symbol location on the plan for ALL items.
     - **CRITICAL**: Automatically select the best extraction strategy (e.g. sweeping clockwise or reading schedules) based on the page layout.
     
     STEP 3: MAPPING
@@ -247,6 +427,10 @@ export const analyzeDrawing = async (
   let lastError: any;
 
   while (attempts < maxAttempts) {
+    if (signal?.aborted) {
+      throw new Error("Analysis cancelled by user.");
+    }
+
     try {
       const response = await ai.models.generateContent({
         model: "gemini-2.5-flash",
@@ -263,8 +447,21 @@ export const analyzeDrawing = async (
         },
       });
 
+      // Check again after heavy lifting
+      if (signal?.aborted) {
+        throw new Error("Analysis cancelled by user.");
+      }
+
       let text = response.text;
       
+      // Fallback: manually extract text if .text getter fails or returns empty
+      if (!text && response.candidates && response.candidates.length > 0) {
+         const parts = response.candidates[0].content?.parts;
+         if (parts) {
+             text = parts.map(p => p.text || "").join("");
+         }
+      }
+
       if (!text && response.candidates && response.candidates.length > 0) {
         const candidate = response.candidates[0];
         if (candidate.finishReason === "MAX_TOKENS") {
@@ -289,12 +486,23 @@ export const analyzeDrawing = async (
         throw new Error(`JSON Parse Failed: ${(parseError as Error).message}`);
       }
 
+      // DEFENSIVE: Ensure arrays are initialized if missing or null
+      // This prevents "Cannot read properties of undefined (reading 'forEach')" later in the app
+      if (!result.takeoff || !Array.isArray(result.takeoff)) result.takeoff = [];
+      if (!result.catalog || !Array.isArray(result.catalog)) result.catalog = [];
+
       // POST-PROCESSING: Crop Catalog Images & Map to Takeoff
+      // This is also heavy, so check abort
+      if (signal?.aborted) throw new Error("Analysis cancelled by user.");
       result = await processVisuals(result, allImages);
 
       return result; // Success, break loop
 
     } catch (error: any) {
+      if (error.message.includes("cancelled by user")) {
+        throw error; // Re-throw cancel immediately without retrying
+      }
+
       lastError = error;
       const msg = error.message || "";
       console.warn(`Gemini Analysis Attempt ${attempts + 1} failed:`, msg);
@@ -304,11 +512,13 @@ export const analyzeDrawing = async (
         msg.includes("500") || 
         msg.includes("503") || 
         msg.includes("Internal error") || 
-        msg.includes("INTERNAL") ||
-        msg.includes("Overloaded")
+        msg.includes("INTERNAL") || 
+        msg.includes("Overloaded") ||
+        msg.includes("No data returned")
       ) {
         attempts++;
         if (attempts < maxAttempts) {
+          if (signal?.aborted) throw new Error("Analysis cancelled by user.");
           const waitTime = 1000 * Math.pow(2, attempts); // 2s, 4s, 8s
           console.log(`Retrying in ${waitTime}ms...`);
           await delay(waitTime);
@@ -405,27 +615,10 @@ function cleanAndRepairJson(text: string): string {
   return clean;
 }
 
-export const fileToBase64 = (file: File): Promise<string> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.readAsDataURL(file);
-    reader.onload = () => {
-      if (typeof reader.result === "string") {
-        const base64 = reader.result.split(",")[1];
-        resolve(base64);
-      } else {
-        reject(new Error("Failed to process file"));
-      }
-    };
-    reader.onerror = (error) => reject(error);
-  });
-};
-
 /**
  * Enhanced Visual Processing:
  * 1. Cropping Catalog images from spec pages.
  * 2. Mapping Catalog images to Takeoff items.
- * 3. Fallback: Cropping symbol images from the Floor Plan if Catalog image is missing.
  */
 async function processVisuals(result: AnalysisResult, allImagesBase64: string[]): Promise<AnalysisResult> {
   // Pre-load all images into HTMLImageElements
@@ -437,8 +630,6 @@ async function processVisuals(result: AnalysisResult, allImagesBase64: string[])
     });
   }));
 
-  const targetImg = loadedImages[loadedImages.length - 1]; // The floor plan is always last
-
   // 1. Process Catalog: Crop images for each type definition
   if (result.catalog && result.catalog.length > 0) {
     result.catalog = await Promise.all(result.catalog.map(async (typeDef) => {
@@ -447,6 +638,9 @@ async function processVisuals(result: AnalysisResult, allImagesBase64: string[])
       // Auto-correct index if only one image exists and model forgot to set it or set it invalid
       if (loadedImages.length === 1 && (imgIndex === undefined || imgIndex === null)) {
           imgIndex = 0;
+      } else if (loadedImages.length > 1 && (imgIndex === undefined || imgIndex === null)) {
+          // If multiple images but index undefined, fallback to target sheet (last one)
+          imgIndex = loadedImages.length - 1;
       }
 
       if (
@@ -457,8 +651,8 @@ async function processVisuals(result: AnalysisResult, allImagesBase64: string[])
         imgIndex < loadedImages.length
       ) {
         const img = loadedImages[imgIndex];
-        // Use 15% padding for spec details to catch dimensions and surrounding context
-        const designImage = await cropImage(img, typeDef.boundingBox, 0.15); 
+        // Use 20% padding to ensure dimension lines and labels are fully captured
+        const designImage = await cropImage(img, typeDef.boundingBox, 0.20); 
         if (designImage) typeDef.designImage = designImage;
       }
       return typeDef;
@@ -471,6 +665,7 @@ async function processVisuals(result: AnalysisResult, allImagesBase64: string[])
   const designMap = new Map<string, string>();
   const fuzzyKeys = new Map<string, string>();
 
+  // Defensive loop in case catalog is somehow undefined
   (result.catalog || []).forEach(c => {
     if (c.designImage) {
       designMap.set(c.typeCode.toLowerCase(), c.designImage);
@@ -479,7 +674,7 @@ async function processVisuals(result: AnalysisResult, allImagesBase64: string[])
     }
   });
 
-  // 3. Process Takeoff Items (Map Match or Fallback Crop)
+  // 3. Process Takeoff Items (Map Match ONLY - NO FLOOR PLAN SYMBOL FALLBACK)
   if (result.takeoff && result.takeoff.length > 0) {
     result.takeoff = await Promise.all(result.takeoff.map(async (item) => {
       // A. Try Exact Match
@@ -502,13 +697,6 @@ async function processVisuals(result: AnalysisResult, allImagesBase64: string[])
               break;
           }
       }
-      if (item.designImage) return item;
-
-      // C. FALLBACK: Crop from Plan (Symbol) if BoundingBox exists
-      if (item.boundingBox && item.boundingBox.length === 4 && targetImg) {
-          const symbolImage = await cropImage(targetImg, item.boundingBox, 0.20); // 20% padding for symbols to capture context/text
-          if (symbolImage) item.designImage = symbolImage;
-      }
       
       return item;
     }));
@@ -518,7 +706,7 @@ async function processVisuals(result: AnalysisResult, allImagesBase64: string[])
 }
 
 // Helper: Crop Image from Canvas
-function cropImage(img: HTMLImageElement, bbox: number[], paddingPct: number): Promise<string | undefined> {
+export function cropImage(img: HTMLImageElement, bbox: number[], paddingPct: number): Promise<string | undefined> {
   return new Promise((resolve) => {
       const [ymin, xmin, ymax, xmax] = bbox;
       const paddingX = (xmax - xmin) * paddingPct;
